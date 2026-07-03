@@ -1,84 +1,103 @@
-mod protocol;
-use crate::{
-    output::{Output, WeakOutput},
-    utils::{SealedFile, user_data::UserDataMap},
-    wayland::compositor::{self, Cacheable},
+//! Implementation of the wp-color-management-v1 protocol (the stabilized staging version
+//! shipped in wayland-protocols).
+//!
+//! Clients use this protocol to describe the colorimetry of their surface contents (e.g.
+//! BT.2020 primaries with the ST 2084 PQ transfer function for HDR video) by creating
+//! parametric image descriptions and attaching them to a `wl_surface`. The attached
+//! description is double-buffered surface state; the committed value can be read with
+//! [`get_surface_description`]. What the compositor *does* with that information (HDR
+//! signalling, color conversion, tone mapping) is entirely up to the compositor — see e.g.
+//! [`ConnectorColorState`](crate::backend::drm::ConnectorColorState) for signalling HDR on a
+//! DRM connector.
+//!
+//! Only *parametric* image descriptions with *named* transfer functions and primaries are
+//! supported; ICC-file and Windows-scRGB descriptions are rejected with `unsupported_feature`.
+//! The compositor chooses which transfer functions, primaries, features and rendering intents
+//! to advertise when creating the [`ColorManagementState`].
+//!
+//! ## Usage
+//!
+//! Implement [`ColorManagementHandler`], create a [`ColorManagementState`] and use
+//! [`delegate_color_management!`](crate::delegate_color_management) to route the protocol
+//! objects. In your rendering/output logic, read the committed description of relevant
+//! surfaces with [`get_surface_description`].
+
+use std::sync::Mutex;
+
+use tracing::{debug, trace};
+use wayland_protocols::wp::color_management::v1::server::{
+    wp_color_management_output_v1::{self, WpColorManagementOutputV1},
+    wp_color_management_surface_feedback_v1::{self, WpColorManagementSurfaceFeedbackV1},
+    wp_color_management_surface_v1::{self, WpColorManagementSurfaceV1},
+    wp_color_manager_v1::{self, WpColorManagerV1},
+    wp_image_description_creator_params_v1::{self, WpImageDescriptionCreatorParamsV1},
+    wp_image_description_info_v1::WpImageDescriptionInfoV1,
+    wp_image_description_v1::{self, WpImageDescriptionV1},
 };
+use wayland_server::protocol::wl_output::WlOutput;
+use wayland_server::protocol::wl_surface::WlSurface;
+use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, Weak};
 
-pub use self::protocol::*;
-mod dispatch;
+use crate::output::Output;
+use crate::wayland::compositor::{self, Cacheable};
 
-use std::{
-    collections::{HashMap, HashSet},
-    fs::File,
-    hash::{Hash, Hasher},
-    io::{Read, Seek, SeekFrom},
-    sync::{Arc, Mutex},
-};
-use wayland_server::{Dispatch, DisplayHandle, GlobalDispatch, Weak, protocol::wl_surface::WlSurface};
-pub use wp_color_manager_v1::{Feature, RenderIntent};
+pub use wp_color_manager_v1::{Feature, Primaries, RenderIntent, TransferFunction};
 
-crate::utils::ids::id_gen!(img_desc_id);
+const VERSION: u32 = 1;
 
-#[derive(Debug)]
-pub struct ColorManagementState {
-    supported_rendering_intents: HashSet<RenderIntent>,
-    supported_features: HashSet<Feature>,
-    supported_tf_cicp: HashSet<u32>,
-    supported_primaries_cicp: HashSet<u32>,
-    known_image_descriptions: HashMap<ImageDescriptionContents, std::sync::Weak<ImageDescriptionInternal>>,
+/// A parsed, immutable parametric image description.
+///
+/// Only named transfer functions and primaries are representable, since those are the only
+/// ones this implementation advertises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageDescription {
+    /// The transfer characteristics of the content.
+    pub transfer: TransferFunction,
+    /// The color primaries of the content.
+    pub primaries: Primaries,
+    /// Maximum content light level in cd/m², if the client provided it.
+    pub max_cll: Option<u32>,
+    /// Maximum frame-average light level in cd/m², if provided.
+    pub max_fall: Option<u32>,
+    /// Mastering display luminance as (min in 0.0001 cd/m², max in cd/m²), if provided.
+    pub mastering_luminance: Option<(u32, u32)>,
+    /// Content luminances as (min in 0.0001 cd/m², max in cd/m², reference white in cd/m²),
+    /// if provided via `set_luminances`.
+    pub luminances: Option<(u32, u32, u32)>,
 }
 
-pub trait ColorManagementHandler {
-    fn color_management_state(&mut self) -> &mut ColorManagementState;
-    fn verify_icc(&mut self, icc_data: &[u8]) -> bool;
-    fn description_for_output(&mut self, output: &Output) -> ImageDescription;
-    fn preferred_description_for_surface(&mut self, surface: &WlSurface) -> ImageDescription;
-}
+impl ImageDescription {
+    /// sRGB / sRGB — the default SDR description, also used for surfaces without an attached
+    /// description.
+    pub const SRGB: Self = Self {
+        transfer: TransferFunction::Srgb,
+        primaries: Primaries::Srgb,
+        max_cll: None,
+        max_fall: None,
+        mastering_luminance: None,
+        luminances: None,
+    };
 
-#[derive(Debug)]
-pub struct ColorManagementOutput {
-    description: Mutex<ImageDescription>,
-    known_instances: Mutex<Vec<wp_color_management_output_v1::WpColorManagementOutputV1>>,
-}
-
-impl ColorManagementOutput {
-    fn new(desc: ImageDescription) -> Self {
-        ColorManagementOutput {
-            description: Mutex::new(desc),
-            known_instances: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn add_instance(&self, instance: wp_color_management_output_v1::WpColorManagementOutputV1) {
-        self.known_instances.lock().unwrap().push(instance);
-    }
-
-    fn remove_instance(&self, instance: &wp_color_management_output_v1::WpColorManagementOutputV1) {
-        self.known_instances.lock().unwrap().retain(|i| i != instance);
+    /// Whether this description denotes HDR/wide-gamut content: an HDR transfer function
+    /// (PQ or HLG) or BT.2020 primaries.
+    pub fn is_hdr(&self) -> bool {
+        matches!(self.transfer, TransferFunction::St2084Pq | TransferFunction::Hlg)
+            || matches!(self.primaries, Primaries::Bt2020)
     }
 }
 
-pub fn get_surface_description(surface: &WlSurface) -> (Option<ImageDescription>, RenderIntent) {
-    let data = compositor::with_states(surface, |states| {
-        states
-            .cached_state
-            .get::<ColorManagementSurfaceCachedState>()
-            .current()
-            .clone()
-    });
-    (data.description, data.render_intent)
-}
-
-#[derive(Debug, Clone)]
-struct ColorManagementSurfaceCachedState {
-    description: Option<ImageDescription>,
-    render_intent: RenderIntent,
+/// Double-buffered per-surface color management state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColorManagementSurfaceCachedState {
+    /// The image description attached to the surface, if any.
+    pub description: Option<ImageDescription>,
+    /// The rendering intent the client prefers for mapping the surface to outputs.
+    pub render_intent: RenderIntent,
 }
 
 impl Default for ColorManagementSurfaceCachedState {
     fn default() -> Self {
-        ColorManagementSurfaceCachedState {
+        Self {
             description: None,
             render_intent: RenderIntent::Perceptual,
         }
@@ -87,7 +106,7 @@ impl Default for ColorManagementSurfaceCachedState {
 
 impl Cacheable for ColorManagementSurfaceCachedState {
     fn commit(&mut self, _dh: &DisplayHandle) -> Self {
-        self.clone()
+        *self
     }
 
     fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
@@ -95,441 +114,748 @@ impl Cacheable for ColorManagementSurfaceCachedState {
     }
 }
 
-#[derive(Debug)]
-pub struct ColorManagementSurfaceData {
-    preferred: Mutex<ImageDescription>,
-    known_instances: Mutex<Vec<wp_color_management_surface_v1::WpColorManagementSurfaceV1>>,
+/// Returns the committed image description and rendering intent of a surface.
+pub fn get_surface_description(surface: &WlSurface) -> (Option<ImageDescription>, RenderIntent) {
+    compositor::with_states(surface, |states| {
+        let state = *states
+            .cached_state
+            .get::<ColorManagementSurfaceCachedState>()
+            .current();
+        (state.description, state.render_intent)
+    })
 }
 
-impl ColorManagementSurfaceData {
-    fn new(preferred_desc: ImageDescription) -> Self {
-        Self {
-            preferred: Mutex::new(preferred_desc),
-            known_instances: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn add_instance(&self, instance: wp_color_management_surface_v1::WpColorManagementSurfaceV1) {
-        self.known_instances.lock().unwrap().push(instance);
-    }
-
-    fn remove_instance(&self, instance: &wp_color_management_surface_v1::WpColorManagementSurfaceV1) {
-        self.known_instances.lock().unwrap().retain(|i| i != instance);
-    }
+/// Marker in the surface's data map enforcing the one-`wp_color_management_surface_v1`-per-
+/// surface rule.
+#[derive(Debug, Default)]
+struct ColorManagementSurfaceData {
+    attached: Mutex<bool>,
 }
 
+/// User data of a `wp_image_description_v1`: the parsed description it represents.
 #[derive(Debug)]
 pub struct ImageDescriptionData {
-    get_information: bool,
-    info: ImageDescription,
+    desc: ImageDescription,
 }
 
-#[derive(Debug, Clone)]
-pub struct ImageDescription(Arc<ImageDescriptionInternal>);
-
-impl PartialEq for ImageDescription {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+impl ImageDescriptionData {
+    /// The description this object represents.
+    pub fn description(&self) -> ImageDescription {
+        self.desc
     }
 }
 
-impl ImageDescription {
-    pub fn contents(&self) -> &ImageDescriptionContents {
-        &self.0.contents
-    }
-    pub fn user_data(&self) -> &UserDataMap {
-        &self.0.user_data
+/// Accumulated parameters of a `wp_image_description_creator_params_v1`, validated on
+/// `create`.
+#[derive(Debug, Default)]
+pub struct ImageDescriptionBuilder {
+    transfer: Option<TransferFunction>,
+    primaries: Option<Primaries>,
+    max_cll: Option<u32>,
+    max_fall: Option<u32>,
+    mastering_luminance: Option<(u32, u32)>,
+    luminances: Option<(u32, u32, u32)>,
+}
+
+/// Global data of `wp_color_manager_v1`, carrying the client visibility filter.
+pub struct ColorManagementGlobalData {
+    filter: Box<dyn Fn(&Client) -> bool + Send + Sync>,
+}
+
+impl std::fmt::Debug for ColorManagementGlobalData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColorManagementGlobalData")
+            .finish_non_exhaustive()
     }
 }
 
+/// Handler trait for wp-color-management-v1.
+pub trait ColorManagementHandler {
+    /// Returns the [`ColorManagementState`].
+    fn color_management_state(&mut self) -> &mut ColorManagementState;
+
+    /// Called when a surface's *pending* image description changed (set or unset). The
+    /// committed value becomes visible via [`get_surface_description`] after the next
+    /// `wl_surface.commit`; compositors typically re-evaluate color handling for the
+    /// surface's output on the next redraw.
+    fn image_description_changed(&mut self, _surface: &WlSurface) {}
+
+    /// The image description describing how the compositor presents the given output.
+    ///
+    /// Defaults to sRGB.
+    fn description_for_output(&mut self, _output: &Output) -> ImageDescription {
+        ImageDescription::SRGB
+    }
+
+    /// The image description the compositor would prefer the given surface to use, reported
+    /// via the surface feedback object.
+    ///
+    /// Defaults to sRGB.
+    fn preferred_description_for_surface(&mut self, _surface: &WlSurface) -> ImageDescription {
+        ImageDescription::SRGB
+    }
+
+    /// Schedules sending the information events for `info` (describing `desc`), to run
+    /// *after* the current request dispatch returns — see [`send_image_description_info`].
+    /// This MUST be deferred (e.g. via an event loop idle callback):
+    /// `wp_image_description_info_v1.done` is a destructor event, and destroying the object
+    /// inside the very callback that created it corrupts wayland-backend's bookkeeping (it
+    /// writes the new object's data after the callback returns, which would then be a
+    /// use-after-free).
+    fn schedule_image_description_info(&mut self, info: WpImageDescriptionInfoV1, desc: ImageDescription);
+}
+
+/// Sends the information events describing `desc` on `info`, terminating with the destructor
+/// `done` event. Must be called *outside* the request callback that created `info` (e.g. from
+/// an event-loop idle), via [`ColorManagementHandler::schedule_image_description_info`].
+pub fn send_image_description_info(info: &WpImageDescriptionInfoV1, desc: &ImageDescription) {
+    if !info.is_alive() {
+        return;
+    }
+    info.primaries_named(desc.primaries);
+    info.tf_named(desc.transfer);
+    if let Some((min, max)) = desc.mastering_luminance {
+        info.target_luminance(min, max);
+    }
+    if let Some(max_cll) = desc.max_cll {
+        info.target_max_cll(max_cll);
+    }
+    if let Some(max_fall) = desc.max_fall {
+        info.target_max_fall(max_fall);
+    }
+    info.done();
+}
+
+/// State of the wp-color-management-v1 global.
 #[derive(Debug)]
-pub struct ImageDescriptionInternal {
-    id: usize,
-    contents: ImageDescriptionContents,
-    user_data: UserDataMap,
-}
-
-impl Drop for ImageDescriptionInternal {
-    fn drop(&mut self) {
-        img_desc_id::remove(self.id);
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct IccData {
-    data: Vec<u8>,
-    file: Arc<Mutex<Option<SealedFile>>>,
-}
-
-impl AsRef<[u8]> for IccData {
-    fn as_ref(&self) -> &[u8] {
-        &self.data
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum ImageDescriptionContents {
-    ICC(IccData),
-    Parametric {
-        tf: TransferFunction,
-        primaries: Primaries,
-        target_primaries: Option<ParametricPrimaries>,
-        target_luminance: Option<(u32, u32)>,
-        max_cll: Option<u32>,
-        max_fall: Option<u32>,
-    },
-}
-
-impl Hash for ImageDescriptionContents {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            ImageDescriptionContents::ICC(IccData { data, .. }) => {
-                data.hash(state);
-            }
-            ImageDescriptionContents::Parametric {
-                tf,
-                primaries,
-                target_primaries,
-                target_luminance,
-                max_cll: max_ccl,
-                max_fall,
-            } => {
-                tf.hash(state);
-                primaries.hash(state);
-                target_primaries.hash(state);
-                target_luminance.hash(state);
-                max_ccl.hash(state);
-                max_fall.hash(state);
-            }
-        }
-    }
-}
-
-impl PartialEq for ImageDescriptionContents {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                ImageDescriptionContents::ICC(IccData { data: data1, .. }),
-                ImageDescriptionContents::ICC(IccData { data: data2, .. }),
-            ) => data1 == data2,
-            (
-                ImageDescriptionContents::Parametric {
-                    tf: tf1,
-                    primaries: primaries1,
-                    target_primaries: target_primaries1,
-                    target_luminance: target_luminance1,
-                    max_cll: max_ccl1,
-                    max_fall: max_fall1,
-                },
-                ImageDescriptionContents::Parametric {
-                    tf: tf2,
-                    primaries: primaries2,
-                    target_primaries: target_primaries2,
-                    target_luminance: target_luminance2,
-                    max_cll: max_ccl2,
-                    max_fall: max_fall2,
-                },
-            ) => {
-                tf1 == tf2
-                    && primaries1 == primaries2
-                    && target_primaries1 == target_primaries2
-                    && target_luminance1 == target_luminance2
-                    && max_ccl1 == max_ccl2
-                    && max_fall1 == max_fall2
-            }
-            _ => false,
-        }
-    }
-}
-
-impl Eq for ImageDescriptionContents {}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TransferFunction {
-    CICP(u32),
-    Power(u32),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Primaries {
-    CICP(u32),
-    Parametric(ParametricPrimaries),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ParametricPrimaries {
-    red: (u32, u32),
-    green: (u32, u32),
-    blue: (u32, u32),
-    white: (u32, u32),
-}
-
-#[derive(Debug, Clone, Copy, thiserror::Error)]
-pub enum DescriptionError {
-    #[error("incomplete parameter set")]
-    IncompleteSet,
-    #[error("invalid combination of parameters")]
-    InconsistentSet,
+pub struct ColorManagementState {
+    supported_tfs: Vec<TransferFunction>,
+    supported_primaries: Vec<Primaries>,
+    supported_features: Vec<Feature>,
+    supported_intents: Vec<RenderIntent>,
+    next_identity: u32,
 }
 
 impl ColorManagementState {
-    pub fn new<D>(
-        dh: &DisplayHandle,
-        supported_rendering_intents: impl Iterator<Item = RenderIntent>,
-        supported_features: impl Iterator<Item = Feature>,
-        supported_tf_cicp: impl Iterator<Item = u32>,
-        supported_primaries_cicp: impl Iterator<Item = u32>,
-    ) -> ColorManagementState
+    /// Creates a new wp-color-management-v1 global.
+    ///
+    /// The supported transfer functions, primaries, features and rendering intents are
+    /// advertised to clients and validated in requests. [`Feature::Parametric`] is always
+    /// advertised (this implementation is parametric-only); [`RenderIntent::Perceptual`]
+    /// is always advertised as required by the protocol.
+    ///
+    /// The global is only visible to clients for which `filter` returns `true`.
+    pub fn new<D, F>(
+        display: &DisplayHandle,
+        supported_tfs: impl IntoIterator<Item = TransferFunction>,
+        supported_primaries: impl IntoIterator<Item = Primaries>,
+        supported_features: impl IntoIterator<Item = Feature>,
+        supported_intents: impl IntoIterator<Item = RenderIntent>,
+        filter: F,
+    ) -> Self
     where
-        D: ColorManagementHandler
-            + GlobalDispatch<wp_color_manager_v1::WpColorManagerV1, (), D>
-            + Dispatch<wp_color_manager_v1::WpColorManagerV1, (), D>
-            + Dispatch<wp_color_management_output_v1::WpColorManagementOutputV1, WeakOutput, D>
-            + Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, Weak<WlSurface>, D>
-            + Dispatch<wp_image_description_v1::WpImageDescriptionV1, (), D>
-            + Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionData, D>
-            + Dispatch<
-                wp_image_description_creator_icc_v1::WpImageDescriptionCreatorIccV1,
-                Mutex<Option<ImageDescriptionIccBuilder>>,
-                D,
-            > + Dispatch<
-                wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
-                Mutex<Option<ImageDescriptionParametricBuilder>>,
-                D,
-            > + 'static,
+        D: GlobalDispatch<WpColorManagerV1, ColorManagementGlobalData>,
+        D: Dispatch<WpColorManagerV1, ()>,
+        D: ColorManagementHandler,
+        D: 'static,
+        F: Fn(&Client) -> bool + Send + Sync + 'static,
     {
-        dh.create_global::<D, wp_color_manager_v1::WpColorManagerV1, ()>(1, ());
-        ColorManagementState {
-            supported_rendering_intents: supported_rendering_intents.collect(),
-            supported_features: supported_features.collect(),
-            supported_tf_cicp: supported_tf_cicp.collect(),
-            supported_primaries_cicp: supported_primaries_cicp.collect(),
-            known_image_descriptions: HashMap::new(),
-        }
-    }
-
-    pub fn build_description(&mut self, contents: ImageDescriptionContents) -> ImageDescription {
-        struct ImageDescriptionWrapper(ImageDescriptionContents);
-        impl TryInto<ImageDescriptionContents> for ImageDescriptionWrapper {
-            type Error = DescriptionError;
-            fn try_into(self) -> Result<ImageDescriptionContents, Self::Error> {
-                Ok(self.0)
-            }
-        }
-
-        self.build_description_internal(ImageDescriptionWrapper(contents))
-            .unwrap()
-    }
-
-    fn build_description_internal<B: TryInto<ImageDescriptionContents, Error = DescriptionError>>(
-        &mut self,
-        contents: B,
-    ) -> Result<ImageDescription, DescriptionError> {
-        let contents = contents.try_into()?;
-        let desc = match self
-            .known_image_descriptions
-            .get(&contents)
-            .and_then(std::sync::Weak::upgrade)
-        {
-            Some(desc) => desc,
-            None => {
-                let desc = Arc::new(ImageDescriptionInternal {
-                    id: img_desc_id::next(),
-                    contents: contents.clone(),
-                    user_data: UserDataMap::new(),
-                });
-                self.known_image_descriptions
-                    .insert(contents, Arc::downgrade(&desc));
-                desc
-            }
+        let data = ColorManagementGlobalData {
+            filter: Box::new(filter),
         };
+        display.create_global::<D, WpColorManagerV1, _>(VERSION, data);
 
-        Ok(ImageDescription(desc))
+        let mut supported_features: Vec<Feature> = supported_features.into_iter().collect();
+        if !supported_features.contains(&Feature::Parametric) {
+            supported_features.push(Feature::Parametric);
+        }
+        let mut supported_intents: Vec<RenderIntent> = supported_intents.into_iter().collect();
+        if !supported_intents.contains(&RenderIntent::Perceptual) {
+            supported_intents.push(RenderIntent::Perceptual);
+        }
+
+        Self {
+            supported_tfs: supported_tfs.into_iter().collect(),
+            supported_primaries: supported_primaries.into_iter().collect(),
+            supported_features,
+            supported_intents,
+            next_identity: 1,
+        }
+    }
+
+    fn next_identity(&mut self) -> u32 {
+        let id = self.next_identity;
+        self.next_identity = self.next_identity.wrapping_add(1).max(1);
+        id
     }
 }
 
-#[derive(Debug, Default)]
-pub struct ImageDescriptionIccBuilder {
-    data: Option<Vec<u8>>,
-}
+impl<D> GlobalDispatch<WpColorManagerV1, ColorManagementGlobalData, D> for ColorManagementState
+where
+    D: GlobalDispatch<WpColorManagerV1, ColorManagementGlobalData>
+        + Dispatch<WpColorManagerV1, ()>
+        + Dispatch<WpColorManagementOutputV1, WlOutput>
+        + Dispatch<WpColorManagementSurfaceV1, Weak<WlSurface>>
+        + Dispatch<WpColorManagementSurfaceFeedbackV1, Weak<WlSurface>>
+        + Dispatch<WpImageDescriptionCreatorParamsV1, Mutex<ImageDescriptionBuilder>>
+        + Dispatch<WpImageDescriptionV1, ImageDescriptionData>
+        + Dispatch<WpImageDescriptionInfoV1, ()>
+        + ColorManagementHandler
+        + 'static,
+{
+    fn bind(
+        state: &mut D,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        manager: New<WpColorManagerV1>,
+        _global_data: &ColorManagementGlobalData,
+        data_init: &mut DataInit<'_, D>,
+    ) {
+        let manager = data_init.init(manager, ());
 
-impl ImageDescriptionIccBuilder {
-    pub fn with_data(&mut self, data: impl AsRef<[u8]>) -> bool {
-        let result = self.data.is_some();
-        self.data = Some(Vec::from(data.as_ref()));
-        result
+        let cm_state = state.color_management_state();
+        for intent in &cm_state.supported_intents {
+            manager.supported_intent(*intent);
+        }
+        for feature in &cm_state.supported_features {
+            manager.supported_feature(*feature);
+        }
+        for tf in &cm_state.supported_tfs {
+            manager.supported_tf_named(*tf);
+        }
+        for primaries in &cm_state.supported_primaries {
+            manager.supported_primaries_named(*primaries);
+        }
+        manager.done();
     }
 
-    pub fn with_file(&mut self, mut file: File, offset: usize, len: usize) -> Result<bool, std::io::Error> {
-        let result = self.data.is_some();
-        file.seek(SeekFrom::Start(offset as u64))?;
+    fn can_view(client: Client, global_data: &ColorManagementGlobalData) -> bool {
+        (global_data.filter)(&client)
+    }
+}
 
-        let mut data = Vec::new();
-        let mut buf = [0u8; 4096];
+impl<D> Dispatch<WpColorManagerV1, (), D> for ColorManagementState
+where
+    D: GlobalDispatch<WpColorManagerV1, ColorManagementGlobalData>
+        + Dispatch<WpColorManagerV1, ()>
+        + Dispatch<WpColorManagementOutputV1, WlOutput>
+        + Dispatch<WpColorManagementSurfaceV1, Weak<WlSurface>>
+        + Dispatch<WpColorManagementSurfaceFeedbackV1, Weak<WlSurface>>
+        + Dispatch<WpImageDescriptionCreatorParamsV1, Mutex<ImageDescriptionBuilder>>
+        + Dispatch<WpImageDescriptionV1, ImageDescriptionData>
+        + Dispatch<WpImageDescriptionInfoV1, ()>
+        + ColorManagementHandler
+        + 'static,
+{
+    fn request(
+        _state: &mut D,
+        _client: &Client,
+        resource: &WpColorManagerV1,
+        request: <WpColorManagerV1 as Resource>::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        data_init: &mut DataInit<'_, D>,
+    ) {
+        use wp_color_manager_v1::Request;
+        match request {
+            Request::GetOutput { id, output } => {
+                data_init.init(id, output);
+            }
+            Request::GetSurface { id, surface } => {
+                let already_attached = compositor::with_states(&surface, |states| {
+                    states
+                        .data_map
+                        .insert_if_missing(ColorManagementSurfaceData::default);
+                    let data = states.data_map.get::<ColorManagementSurfaceData>().unwrap();
+                    let mut attached = data.attached.lock().unwrap();
+                    std::mem::replace(&mut *attached, true)
+                });
+                if already_attached {
+                    resource.post_error(
+                        wp_color_manager_v1::Error::SurfaceExists,
+                        "surface already has a wp_color_management_surface_v1",
+                    );
+                    return;
+                }
+                data_init.init(id, surface.downgrade());
+            }
+            Request::GetSurfaceFeedback { id, surface } => {
+                data_init.init(id, surface.downgrade());
+            }
+            Request::CreateParametricCreator { obj } => {
+                data_init.init(obj, Mutex::new(ImageDescriptionBuilder::default()));
+            }
+            Request::CreateIccCreator { .. } => {
+                resource.post_error(
+                    wp_color_manager_v1::Error::UnsupportedFeature,
+                    "ICC image descriptions are not supported",
+                );
+            }
+            Request::CreateWindowsScrgb { .. } => {
+                resource.post_error(
+                    wp_color_manager_v1::Error::UnsupportedFeature,
+                    "Windows scRGB image descriptions are not supported",
+                );
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
 
-        while let Ok(size) = file.read(&mut buf) {
-            if data.len() + size >= len {
-                data.extend(&buf[0..(len - data.len())]);
-                break;
-            } else {
-                data.extend(&buf);
+impl<D> Dispatch<WpColorManagementOutputV1, WlOutput, D> for ColorManagementState
+where
+    D: GlobalDispatch<WpColorManagerV1, ColorManagementGlobalData>
+        + Dispatch<WpColorManagerV1, ()>
+        + Dispatch<WpColorManagementOutputV1, WlOutput>
+        + Dispatch<WpColorManagementSurfaceV1, Weak<WlSurface>>
+        + Dispatch<WpColorManagementSurfaceFeedbackV1, Weak<WlSurface>>
+        + Dispatch<WpImageDescriptionCreatorParamsV1, Mutex<ImageDescriptionBuilder>>
+        + Dispatch<WpImageDescriptionV1, ImageDescriptionData>
+        + Dispatch<WpImageDescriptionInfoV1, ()>
+        + ColorManagementHandler
+        + 'static,
+{
+    fn request(
+        state: &mut D,
+        _client: &Client,
+        _resource: &WpColorManagementOutputV1,
+        request: <WpColorManagementOutputV1 as Resource>::Request,
+        wl_output: &WlOutput,
+        _dhandle: &DisplayHandle,
+        data_init: &mut DataInit<'_, D>,
+    ) {
+        use wp_color_management_output_v1::Request;
+        match request {
+            Request::GetImageDescription { image_description } => {
+                let desc = Output::from_resource(wl_output)
+                    .map(|output| state.description_for_output(&output))
+                    .unwrap_or(ImageDescription::SRGB);
+                make_ready_description(state, image_description, desc, data_init);
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl<D> Dispatch<WpColorManagementSurfaceV1, Weak<WlSurface>, D> for ColorManagementState
+where
+    D: GlobalDispatch<WpColorManagerV1, ColorManagementGlobalData>
+        + Dispatch<WpColorManagerV1, ()>
+        + Dispatch<WpColorManagementOutputV1, WlOutput>
+        + Dispatch<WpColorManagementSurfaceV1, Weak<WlSurface>>
+        + Dispatch<WpColorManagementSurfaceFeedbackV1, Weak<WlSurface>>
+        + Dispatch<WpImageDescriptionCreatorParamsV1, Mutex<ImageDescriptionBuilder>>
+        + Dispatch<WpImageDescriptionV1, ImageDescriptionData>
+        + Dispatch<WpImageDescriptionInfoV1, ()>
+        + ColorManagementHandler
+        + 'static,
+{
+    fn request(
+        state: &mut D,
+        _client: &Client,
+        resource: &WpColorManagementSurfaceV1,
+        request: <WpColorManagementSurfaceV1 as Resource>::Request,
+        data: &Weak<WlSurface>,
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, D>,
+    ) {
+        use wp_color_management_surface_v1::Request;
+        match request {
+            Request::SetImageDescription {
+                image_description,
+                render_intent,
+            } => {
+                let Ok(surface) = data.upgrade() else {
+                    resource.post_error(
+                        wp_color_management_surface_v1::Error::Inert,
+                        "the underlying wl_surface was destroyed",
+                    );
+                    return;
+                };
+
+                let render_intent = match render_intent.into_result() {
+                    Ok(intent) if state.color_management_state().supported_intents.contains(&intent) => {
+                        intent
+                    }
+                    _ => {
+                        resource.post_error(
+                            wp_color_management_surface_v1::Error::RenderIntent,
+                            "unsupported rendering intent",
+                        );
+                        return;
+                    }
+                };
+
+                let Some(desc) = image_description.data::<ImageDescriptionData>().map(|d| d.desc) else {
+                    resource.post_error(
+                        wp_color_management_surface_v1::Error::ImageDescription,
+                        "image description is not ready",
+                    );
+                    return;
+                };
+
+                if set_pending_description(&surface, Some(desc), render_intent) {
+                    if desc.is_hdr() {
+                        debug!(surface = ?surface.id(), ?desc, "client attached an HDR image description");
+                    } else {
+                        trace!(surface = ?surface.id(), ?desc, "client attached an image description");
+                    }
+                    state.image_description_changed(&surface);
+                }
+            }
+            Request::UnsetImageDescription => {
+                let Ok(surface) = data.upgrade() else {
+                    resource.post_error(
+                        wp_color_management_surface_v1::Error::Inert,
+                        "the underlying wl_surface was destroyed",
+                    );
+                    return;
+                };
+                if set_pending_description(&surface, None, RenderIntent::Perceptual) {
+                    state.image_description_changed(&surface);
+                }
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+
+    fn destroyed(
+        state: &mut D,
+        _client: wayland_server::backend::ClientId,
+        _resource: &WpColorManagementSurfaceV1,
+        data: &Weak<WlSurface>,
+    ) {
+        // Destroying the object does the same as unset_image_description, and allows
+        // attaching a new wp_color_management_surface_v1 to the surface.
+        if let Ok(surface) = data.upgrade() {
+            let changed = compositor::with_states(&surface, |states| {
+                if let Some(data) = states.data_map.get::<ColorManagementSurfaceData>() {
+                    *data.attached.lock().unwrap() = false;
+                }
+                let mut guard = states.cached_state.get::<ColorManagementSurfaceCachedState>();
+                let pending = guard.pending();
+                let changed = pending.description.is_some();
+                *pending = ColorManagementSurfaceCachedState::default();
+                changed
+            });
+            if changed {
+                state.image_description_changed(&surface);
             }
         }
-        self.data = Some(data);
-
-        Ok(result)
     }
 }
 
-impl TryInto<ImageDescriptionContents> for ImageDescriptionIccBuilder {
-    type Error = DescriptionError;
-    fn try_into(self) -> Result<ImageDescriptionContents, Self::Error> {
-        if self.data.is_none() {
-            return Err(DescriptionError::IncompleteSet);
+/// Stores a new pending image description on the surface. Returns whether the pending value
+/// actually changed — clients (e.g. mpv) re-attach the same description every frame, and
+/// callers only want to react/log on real changes.
+fn set_pending_description(
+    surface: &WlSurface,
+    description: Option<ImageDescription>,
+    render_intent: RenderIntent,
+) -> bool {
+    compositor::with_states(surface, |states| {
+        let mut guard = states.cached_state.get::<ColorManagementSurfaceCachedState>();
+        let pending = guard.pending();
+        let new = ColorManagementSurfaceCachedState {
+            description,
+            render_intent,
+        };
+        if *pending == new {
+            false
+        } else {
+            *pending = new;
+            true
         }
-
-        Ok(ImageDescriptionContents::ICC(IccData {
-            data: self.data.unwrap(),
-            file: Arc::new(Mutex::new(None)),
-        }))
-    }
+    })
 }
 
-#[derive(Debug, Default)]
-pub struct ImageDescriptionParametricBuilder {
-    tf: Option<TransferFunction>,
-    primaries: Option<Primaries>,
-    target_primaries: Option<ParametricPrimaries>,
-    target_luminance: Option<(u32, u32)>,
-    max_cll: Option<u32>,
-    max_fall: Option<u32>,
-}
-
-impl ImageDescriptionParametricBuilder {
-    pub fn set_tf(&mut self, tf: TransferFunction) -> bool {
-        let result = self.tf.is_some();
-        self.tf = Some(tf);
-        result
-    }
-
-    pub fn set_primaries(&mut self, primaries: Primaries) -> bool {
-        let result = self.primaries.is_some();
-        self.primaries = Some(primaries);
-        result
-    }
-
-    pub fn set_target_primaries(&mut self, target_primaries: ParametricPrimaries) -> bool {
-        let result = self.target_primaries.is_some();
-        self.target_primaries = Some(target_primaries);
-        result
-    }
-
-    pub fn set_target_luminance(&mut self, target_lumninance: (u32, u32)) -> bool {
-        let result = self.target_luminance.is_some();
-        self.target_luminance = Some(target_lumninance);
-        result
-    }
-
-    pub fn set_max_cll(&mut self, max_ccl: u32) -> bool {
-        let result = self.max_cll.is_some();
-        self.max_cll = Some(max_ccl);
-        result
-    }
-
-    pub fn set_max_fall(&mut self, max_fall: u32) -> bool {
-        let result = self.max_fall.is_some();
-        self.max_fall = Some(max_fall);
-        result
-    }
-}
-
-impl TryInto<ImageDescriptionContents> for ImageDescriptionParametricBuilder {
-    type Error = DescriptionError;
-    fn try_into(self) -> Result<ImageDescriptionContents, Self::Error> {
-        if (self.target_luminance.is_some() || self.max_cll.is_some() || self.max_fall.is_some())
-            && !(self.tf == Some(TransferFunction::CICP(16)) || self.tf == Some(TransferFunction::CICP(18)))
-        {
-            return Err(DescriptionError::InconsistentSet);
+impl<D> Dispatch<WpColorManagementSurfaceFeedbackV1, Weak<WlSurface>, D> for ColorManagementState
+where
+    D: GlobalDispatch<WpColorManagerV1, ColorManagementGlobalData>
+        + Dispatch<WpColorManagerV1, ()>
+        + Dispatch<WpColorManagementOutputV1, WlOutput>
+        + Dispatch<WpColorManagementSurfaceV1, Weak<WlSurface>>
+        + Dispatch<WpColorManagementSurfaceFeedbackV1, Weak<WlSurface>>
+        + Dispatch<WpImageDescriptionCreatorParamsV1, Mutex<ImageDescriptionBuilder>>
+        + Dispatch<WpImageDescriptionV1, ImageDescriptionData>
+        + Dispatch<WpImageDescriptionInfoV1, ()>
+        + ColorManagementHandler
+        + 'static,
+{
+    fn request(
+        state: &mut D,
+        _client: &Client,
+        resource: &WpColorManagementSurfaceFeedbackV1,
+        request: <WpColorManagementSurfaceFeedbackV1 as Resource>::Request,
+        data: &Weak<WlSurface>,
+        _dhandle: &DisplayHandle,
+        data_init: &mut DataInit<'_, D>,
+    ) {
+        use wp_color_management_surface_feedback_v1::Request;
+        match request {
+            Request::GetPreferred { image_description }
+            | Request::GetPreferredParametric { image_description } => {
+                let Ok(surface) = data.upgrade() else {
+                    resource.post_error(
+                        wp_color_management_surface_feedback_v1::Error::Inert,
+                        "the underlying wl_surface was destroyed",
+                    );
+                    return;
+                };
+                let desc = state.preferred_description_for_surface(&surface);
+                make_ready_description(state, image_description, desc, data_init);
+            }
+            Request::Destroy => {}
+            _ => {}
         }
-
-        if self.tf.is_none() || self.primaries.is_none() {
-            return Err(DescriptionError::IncompleteSet);
-        }
-
-        Ok(ImageDescriptionContents::Parametric {
-            tf: self.tf.unwrap(),
-            primaries: self.primaries.unwrap(),
-            target_primaries: self.target_primaries,
-            target_luminance: self.target_luminance,
-            max_cll: self.max_cll,
-            max_fall: self.max_fall,
-        })
     }
 }
 
-/// Macro to delegate implementation of the wp color management protocol
+impl<D> Dispatch<WpImageDescriptionCreatorParamsV1, Mutex<ImageDescriptionBuilder>, D>
+    for ColorManagementState
+where
+    D: GlobalDispatch<WpColorManagerV1, ColorManagementGlobalData>
+        + Dispatch<WpColorManagerV1, ()>
+        + Dispatch<WpColorManagementOutputV1, WlOutput>
+        + Dispatch<WpColorManagementSurfaceV1, Weak<WlSurface>>
+        + Dispatch<WpColorManagementSurfaceFeedbackV1, Weak<WlSurface>>
+        + Dispatch<WpImageDescriptionCreatorParamsV1, Mutex<ImageDescriptionBuilder>>
+        + Dispatch<WpImageDescriptionV1, ImageDescriptionData>
+        + Dispatch<WpImageDescriptionInfoV1, ()>
+        + ColorManagementHandler
+        + 'static,
+{
+    fn request(
+        state: &mut D,
+        _client: &Client,
+        resource: &WpImageDescriptionCreatorParamsV1,
+        request: <WpImageDescriptionCreatorParamsV1 as Resource>::Request,
+        data: &Mutex<ImageDescriptionBuilder>,
+        _dhandle: &DisplayHandle,
+        data_init: &mut DataInit<'_, D>,
+    ) {
+        use wp_image_description_creator_params_v1::{Error, Request};
+        match request {
+            Request::SetTfNamed { tf } => {
+                let mut params = data.lock().unwrap();
+                if params.transfer.is_some() {
+                    resource.post_error(Error::AlreadySet, "transfer function already set");
+                    return;
+                }
+                match tf
+                    .into_result()
+                    .ok()
+                    .filter(|tf| state.color_management_state().supported_tfs.contains(tf))
+                {
+                    Some(tf) => params.transfer = Some(tf),
+                    None => resource.post_error(Error::InvalidTf, "unsupported transfer function"),
+                }
+            }
+            Request::SetPrimariesNamed { primaries } => {
+                let mut params = data.lock().unwrap();
+                if params.primaries.is_some() {
+                    resource.post_error(Error::AlreadySet, "primaries already set");
+                    return;
+                }
+                match primaries
+                    .into_result()
+                    .ok()
+                    .filter(|p| state.color_management_state().supported_primaries.contains(p))
+                {
+                    Some(p) => params.primaries = Some(p),
+                    None => resource.post_error(Error::InvalidPrimariesNamed, "unsupported primaries"),
+                }
+            }
+            Request::SetMasteringLuminance { min_lum, max_lum } => {
+                data.lock().unwrap().mastering_luminance = Some((min_lum, max_lum));
+            }
+            Request::SetMaxCll { max_cll } => {
+                data.lock().unwrap().max_cll = Some(max_cll);
+            }
+            Request::SetMaxFall { max_fall } => {
+                data.lock().unwrap().max_fall = Some(max_fall);
+            }
+            Request::SetLuminances {
+                min_lum,
+                max_lum,
+                reference_lum,
+            } => {
+                if !state
+                    .color_management_state()
+                    .supported_features
+                    .contains(&Feature::SetLuminances)
+                {
+                    resource.post_error(Error::UnsupportedFeature, "set_luminances is not supported");
+                    return;
+                }
+                data.lock().unwrap().luminances = Some((min_lum, max_lum, reference_lum));
+            }
+            Request::SetMasteringDisplayPrimaries { .. } => {
+                // Accepted (if advertised) so HDR clients can convey mastering metadata
+                // without erroring; the values are not used yet.
+                if !state
+                    .color_management_state()
+                    .supported_features
+                    .contains(&Feature::SetMasteringDisplayPrimaries)
+                {
+                    resource.post_error(
+                        Error::UnsupportedFeature,
+                        "set_mastering_display_primaries is not supported",
+                    );
+                }
+            }
+            Request::SetTfPower { .. } => {
+                resource.post_error(Error::UnsupportedFeature, "set_tf_power is not supported");
+            }
+            Request::SetPrimaries { .. } => {
+                resource.post_error(Error::UnsupportedFeature, "set_primaries is not supported");
+            }
+            Request::Create { image_description } => {
+                let params = data.lock().unwrap();
+                let (Some(transfer), Some(primaries)) = (params.transfer, params.primaries) else {
+                    resource.post_error(
+                        Error::IncompleteSet,
+                        "transfer function and primaries are both required",
+                    );
+                    return;
+                };
+                let desc = ImageDescription {
+                    transfer,
+                    primaries,
+                    max_cll: params.max_cll,
+                    max_fall: params.max_fall,
+                    mastering_luminance: params.mastering_luminance,
+                    luminances: params.luminances,
+                };
+                drop(params);
+                make_ready_description(state, image_description, desc, data_init);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<D> Dispatch<WpImageDescriptionV1, ImageDescriptionData, D> for ColorManagementState
+where
+    D: GlobalDispatch<WpColorManagerV1, ColorManagementGlobalData>
+        + Dispatch<WpColorManagerV1, ()>
+        + Dispatch<WpColorManagementOutputV1, WlOutput>
+        + Dispatch<WpColorManagementSurfaceV1, Weak<WlSurface>>
+        + Dispatch<WpColorManagementSurfaceFeedbackV1, Weak<WlSurface>>
+        + Dispatch<WpImageDescriptionCreatorParamsV1, Mutex<ImageDescriptionBuilder>>
+        + Dispatch<WpImageDescriptionV1, ImageDescriptionData>
+        + Dispatch<WpImageDescriptionInfoV1, ()>
+        + ColorManagementHandler
+        + 'static,
+{
+    fn request(
+        state: &mut D,
+        _client: &Client,
+        _resource: &WpImageDescriptionV1,
+        request: <WpImageDescriptionV1 as Resource>::Request,
+        data: &ImageDescriptionData,
+        _dhandle: &DisplayHandle,
+        data_init: &mut DataInit<'_, D>,
+    ) {
+        use wp_image_description_v1::Request;
+        match request {
+            Request::GetInformation { information } => {
+                // The actual events (ending in the destructor `done`) are sent deferred —
+                // see the handler doc.
+                let info = data_init.init(information, ());
+                state.schedule_image_description_info(info, data.desc);
+            }
+            Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl<D> Dispatch<WpImageDescriptionInfoV1, (), D> for ColorManagementState
+where
+    D: GlobalDispatch<WpColorManagerV1, ColorManagementGlobalData>
+        + Dispatch<WpColorManagerV1, ()>
+        + Dispatch<WpColorManagementOutputV1, WlOutput>
+        + Dispatch<WpColorManagementSurfaceV1, Weak<WlSurface>>
+        + Dispatch<WpColorManagementSurfaceFeedbackV1, Weak<WlSurface>>
+        + Dispatch<WpImageDescriptionCreatorParamsV1, Mutex<ImageDescriptionBuilder>>
+        + Dispatch<WpImageDescriptionV1, ImageDescriptionData>
+        + Dispatch<WpImageDescriptionInfoV1, ()>
+        + ColorManagementHandler
+        + 'static,
+{
+    fn request(
+        _state: &mut D,
+        _client: &Client,
+        _resource: &WpImageDescriptionInfoV1,
+        _request: <WpImageDescriptionInfoV1 as Resource>::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, D>,
+    ) {
+        // wp_image_description_info_v1 has no requests.
+    }
+}
+
+/// Initializes a `wp_image_description_v1` carrying `desc` and immediately marks it ready.
+fn make_ready_description<D>(
+    state: &mut D,
+    image_description: New<WpImageDescriptionV1>,
+    desc: ImageDescription,
+    data_init: &mut DataInit<'_, D>,
+) where
+    D: Dispatch<WpImageDescriptionV1, ImageDescriptionData> + ColorManagementHandler + 'static,
+{
+    let identity = state.color_management_state().next_identity();
+    let image = data_init.init(image_description, ImageDescriptionData { desc });
+    image.ready(identity);
+}
+
+/// Macro to delegate implementation of the wp-color-management-v1 protocol.
 #[macro_export]
 macro_rules! delegate_color_management {
     ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        type __WpColorManagerV1 =
-            $crate::wayland::color::management::wp_color_manager_v1::WpColorManagerV1;
-        type __WpColorManagementOutputV1 =
-            $crate::wayland::color::management::wp_color_management_output_v1::WpColorManagementOutputV1;
-        type __WpColorManagementSurfaceV1 =
-            $crate::wayland::color::management::wp_color_management_surface_v1::WpColorManagementSurfaceV1;
-        type __WpImageDescriptionV1 =
-            $crate::wayland::color::management::wp_image_description_v1::WpImageDescriptionV1;
-        type __WpImageDescriptionCreatorIccV1 =
-            $crate::wayland::color::management::wp_image_description_creator_icc_v1::WpImageDescriptionCreatorIccV1;
-        type __WpImageDescriptionCreatorParamsV1 =
-            $crate::wayland::color::management::wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1;
+        type __WpColorManagerV1 = $crate::reexports::wayland_protocols::wp::color_management::v1::server::wp_color_manager_v1::WpColorManagerV1;
+        type __WpCmOutput = $crate::reexports::wayland_protocols::wp::color_management::v1::server::wp_color_management_output_v1::WpColorManagementOutputV1;
+        type __WpCmSurface = $crate::reexports::wayland_protocols::wp::color_management::v1::server::wp_color_management_surface_v1::WpColorManagementSurfaceV1;
+        type __WpCmSurfaceFeedback = $crate::reexports::wayland_protocols::wp::color_management::v1::server::wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1;
+        type __WpCmParams = $crate::reexports::wayland_protocols::wp::color_management::v1::server::wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1;
+        type __WpCmImageDesc = $crate::reexports::wayland_protocols::wp::color_management::v1::server::wp_image_description_v1::WpImageDescriptionV1;
+        type __WpCmImageDescInfo = $crate::reexports::wayland_protocols::wp::color_management::v1::server::wp_image_description_info_v1::WpImageDescriptionInfoV1;
 
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
-            [
-                __WpColorManagerV1: ()
-            ] => $crate::wayland::color::management::ColorManagementState
-        );
+        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
+            __WpColorManagerV1: $crate::wayland::color::management::ColorManagementGlobalData
+        ] => $crate::wayland::color::management::ColorManagementState);
 
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
-            [
-                __WpColorManagerV1: ()
-            ] => $crate::wayland::color::management::ColorManagementState
-        );
+        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
+            __WpColorManagerV1: ()
+        ] => $crate::wayland::color::management::ColorManagementState);
 
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
-            [
-                __WpColorManagementOutputV1: $crate::output::WeakOutput
-            ] => $crate::wayland::color::management::ColorManagementState
-        );
+        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
+            __WpCmOutput: $crate::reexports::wayland_server::protocol::wl_output::WlOutput
+        ] => $crate::wayland::color::management::ColorManagementState);
 
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
-            [
-                __WpColorManagementSurfaceV1: $crate::reexports::wayland_server::Weak<$crate::reexports::wayland_server::protocol::wl_surface::WlSurface>
-            ] => $crate::wayland::color::management::ColorManagementState
-        );
+        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
+            __WpCmSurface: $crate::reexports::wayland_server::Weak<$crate::reexports::wayland_server::protocol::wl_surface::WlSurface>
+        ] => $crate::wayland::color::management::ColorManagementState);
 
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
-            [
-                __WpImageDescriptionV1: ()
-            ] => $crate::wayland::color::management::ColorManagementState
-        );
+        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
+            __WpCmSurfaceFeedback: $crate::reexports::wayland_server::Weak<$crate::reexports::wayland_server::protocol::wl_surface::WlSurface>
+        ] => $crate::wayland::color::management::ColorManagementState);
 
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
-            [
-                __WpImageDescriptionV1: $crate::wayland::color::management::ImageDescriptionData
-            ] => $crate::wayland::color::management::ColorManagementState
-        );
+        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
+            __WpCmParams: std::sync::Mutex<$crate::wayland::color::management::ImageDescriptionBuilder>
+        ] => $crate::wayland::color::management::ColorManagementState);
 
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
-            [
-                __WpImageDescriptionCreatorIccV1: std::sync::Mutex<Option<$crate::wayland::color::management::ImageDescriptionIccBuilder>>
-            ] => $crate::wayland::color::management::ColorManagementState
-        );
+        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
+            __WpCmImageDesc: $crate::wayland::color::management::ImageDescriptionData
+        ] => $crate::wayland::color::management::ColorManagementState);
 
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
-            [
-                __WpImageDescriptionCreatorParamsV1: std::sync::Mutex<Option<$crate::wayland::color::management::ImageDescriptionParametricBuilder>>
-            ] => $crate::wayland::color::management::ColorManagementState
-        );
+        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
+            __WpCmImageDescInfo: ()
+        ] => $crate::wayland::color::management::ColorManagementState);
     };
 }
