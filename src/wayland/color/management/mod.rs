@@ -125,11 +125,15 @@ pub fn get_surface_description(surface: &WlSurface) -> (Option<ImageDescription>
     })
 }
 
-/// Marker in the surface's data map enforcing the one-`wp_color_management_surface_v1`-per-
-/// surface rule.
+/// Per-surface color-management bookkeeping in the surface's data map: enforces the
+/// one-`wp_color_management_surface_v1`-per-surface rule and tracks the surface's feedback
+/// objects for `preferred_changed`.
 #[derive(Debug, Default)]
 struct ColorManagementSurfaceData {
     attached: Mutex<bool>,
+    feedbacks: Mutex<Vec<WpColorManagementSurfaceFeedbackV1>>,
+    /// Identity of the last preferred description notified for this surface, for dedupe.
+    last_preferred: Mutex<Option<u32>>,
 }
 
 /// User data of a `wp_image_description_v1`: the parsed description it represents.
@@ -233,7 +237,16 @@ pub struct ColorManagementState {
     supported_primaries: Vec<Primaries>,
     supported_features: Vec<Feature>,
     supported_intents: Vec<RenderIntent>,
-    next_identity: u32,
+    /// Known distinct image descriptions; a description's identity is its index + 1.
+    ///
+    /// Identities must be stable so that the identity sent in `preferred_changed` matches the
+    /// identity a subsequent `get_preferred` delivers via `ready`. The table grows
+    /// monotonically with distinct descriptions, which is bounded in practice (clients create
+    /// the same few descriptions).
+    identities: Vec<ImageDescription>,
+    /// Live `wp_color_management_output_v1` objects per output, for
+    /// [`output_description_changed`](Self::output_description_changed).
+    output_objects: Vec<WpColorManagementOutputV1>,
 }
 
 impl ColorManagementState {
@@ -279,14 +292,69 @@ impl ColorManagementState {
             supported_primaries: supported_primaries.into_iter().collect(),
             supported_features,
             supported_intents,
-            next_identity: 1,
+            identities: Vec::new(),
+            output_objects: Vec::new(),
         }
     }
 
-    fn next_identity(&mut self) -> u32 {
-        let id = self.next_identity;
-        self.next_identity = self.next_identity.wrapping_add(1).max(1);
-        id
+    /// Returns the stable identity for a description, assigning a new one if it is not known
+    /// yet.
+    fn identity_for(&mut self, desc: ImageDescription) -> u32 {
+        let index = match self.identities.iter().position(|d| *d == desc) {
+            Some(index) => index,
+            None => {
+                self.identities.push(desc);
+                self.identities.len() - 1
+            }
+        };
+        index as u32 + 1
+    }
+
+    /// Notifies the given surface's feedback objects that the compositor's preferred image
+    /// description for it changed.
+    ///
+    /// Deduplicated per surface: notifying the same description again is a no-op, so this is
+    /// safe to call from a periodic refresh. Clients react by calling `get_preferred`, which
+    /// routes through
+    /// [`ColorManagementHandler::preferred_description_for_surface`] — that must already
+    /// return the new description when this is called.
+    pub fn preferred_changed(&mut self, surface: &WlSurface, desc: ImageDescription) {
+        let identity = self.identity_for(desc);
+        compositor::with_states(surface, |states| {
+            let Some(data) = states.data_map.get::<ColorManagementSurfaceData>() else {
+                return;
+            };
+            let mut last_preferred = data.last_preferred.lock().unwrap();
+            if *last_preferred == Some(identity) {
+                return;
+            }
+            *last_preferred = Some(identity);
+
+            let mut feedbacks = data.feedbacks.lock().unwrap();
+            feedbacks.retain(|feedback| feedback.is_alive());
+            for feedback in feedbacks.iter() {
+                feedback.preferred_changed(identity);
+            }
+        });
+    }
+
+    /// Notifies all `wp_color_management_output_v1` objects of the given output that its
+    /// image description changed.
+    ///
+    /// Clients react by calling `get_image_description`, which routes through
+    /// [`ColorManagementHandler::description_for_output`] — that must already return the new
+    /// description when this is called.
+    pub fn output_description_changed(&mut self, output: &Output) {
+        self.output_objects.retain(|obj| obj.is_alive());
+        for obj in &self.output_objects {
+            let same_output = obj
+                .data::<WlOutput>()
+                .and_then(Output::from_resource)
+                .is_some_and(|o| o == *output);
+            if same_output {
+                obj.image_description_changed();
+            }
+        }
     }
 }
 
@@ -348,7 +416,7 @@ where
         + 'static,
 {
     fn request(
-        _state: &mut D,
+        state: &mut D,
         _client: &Client,
         resource: &WpColorManagerV1,
         request: <WpColorManagerV1 as Resource>::Request,
@@ -359,7 +427,8 @@ where
         use wp_color_manager_v1::Request;
         match request {
             Request::GetOutput { id, output } => {
-                data_init.init(id, output);
+                let obj = data_init.init(id, output);
+                state.color_management_state().output_objects.push(obj);
             }
             Request::GetSurface { id, surface } => {
                 let already_attached = compositor::with_states(&surface, |states| {
@@ -380,7 +449,15 @@ where
                 data_init.init(id, surface.downgrade());
             }
             Request::GetSurfaceFeedback { id, surface } => {
-                data_init.init(id, surface.downgrade());
+                let feedback = data_init.init(id, surface.downgrade());
+                // Track the feedback object so `preferred_changed` can reach it.
+                compositor::with_states(&surface, |states| {
+                    states
+                        .data_map
+                        .insert_if_missing(ColorManagementSurfaceData::default);
+                    let data = states.data_map.get::<ColorManagementSurfaceData>().unwrap();
+                    data.feedbacks.lock().unwrap().push(feedback);
+                });
             }
             Request::CreateParametricCreator { obj } => {
                 data_init.init(obj, Mutex::new(ImageDescriptionBuilder::default()));
@@ -612,6 +689,21 @@ where
             _ => {}
         }
     }
+
+    fn destroyed(
+        _state: &mut D,
+        _client: wayland_server::backend::ClientId,
+        resource: &WpColorManagementSurfaceFeedbackV1,
+        data: &Weak<WlSurface>,
+    ) {
+        if let Ok(surface) = data.upgrade() {
+            compositor::with_states(&surface, |states| {
+                if let Some(data) = states.data_map.get::<ColorManagementSurfaceData>() {
+                    data.feedbacks.lock().unwrap().retain(|f| f != resource);
+                }
+            });
+        }
+    }
 }
 
 impl<D> Dispatch<WpImageDescriptionCreatorParamsV1, Mutex<ImageDescriptionBuilder>, D>
@@ -809,7 +901,7 @@ fn make_ready_description<D>(
 ) where
     D: Dispatch<WpImageDescriptionV1, ImageDescriptionData> + ColorManagementHandler + 'static,
 {
-    let identity = state.color_management_state().next_identity();
+    let identity = state.color_management_state().identity_for(desc);
     let image = data_init.init(image_description, ImageDescriptionData { desc });
     image.ready(identity);
 }
@@ -858,4 +950,48 @@ macro_rules! delegate_color_management {
             __WpCmImageDescInfo: ()
         ] => $crate::wayland::color::management::ColorManagementState);
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identities_are_stable_per_description() {
+        let mut state = ColorManagementState {
+            supported_tfs: Vec::new(),
+            supported_primaries: Vec::new(),
+            supported_features: Vec::new(),
+            supported_intents: Vec::new(),
+            identities: Vec::new(),
+            output_objects: Vec::new(),
+        };
+
+        let srgb = ImageDescription::SRGB;
+        let pq = ImageDescription {
+            transfer: TransferFunction::St2084Pq,
+            primaries: Primaries::Bt2020,
+            max_cll: Some(800),
+            max_fall: Some(400),
+            mastering_luminance: None,
+            luminances: None,
+        };
+
+        let a = state.identity_for(srgb);
+        let b = state.identity_for(pq);
+        assert_ne!(a, b);
+        assert_ne!(a, 0, "identity 0 is reserved by the protocol");
+        assert_ne!(b, 0);
+        // The same description always maps to the same identity.
+        assert_eq!(state.identity_for(srgb), a);
+        assert_eq!(state.identity_for(pq), b);
+        // A description differing only in metadata gets its own identity.
+        let pq_brighter = ImageDescription {
+            max_cll: Some(1000),
+            ..pq
+        };
+        let c = state.identity_for(pq_brighter);
+        assert_ne!(c, b);
+        assert_eq!(state.identity_for(pq), b);
+    }
 }
